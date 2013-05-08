@@ -1,0 +1,379 @@
+#!/bin/bash
+
+#The MIT License (MIT)
+#
+#Copyright (c) <2013> <Christian Speckner cnspeckn@googlemail.com>
+#
+#Permission is hereby granted, free of charge, to any person obtaining a copy
+#of this software and associated documentation files (the "Software"), to deal
+#in the Software without restriction, including without limitation the rights
+#to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+#copies of the Software, and to permit persons to whom the Software is
+#furnished to do so, subject to the following conditions:
+#
+#The above copyright notice and this permission notice shall be included in
+#all copies or substantial portions of the Software.
+#
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+#OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+#THE SOFTWARE.
+
+# Tool for comparing two trees and classifying changes into removed, added and changed.
+# The result is written to files and, in addition, diffs are generated for the changes.
+# After editing the changes, the script can be used to apply only requested changes.
+
+# Christian Speckner 03/16/08
+
+# create temporary directory and set up global variables
+tmpdir="/tmp/difftool_$$"
+adir="$tmpdir/a"
+bdir="$tmpdir/b"
+difftmp="$tmpdir/diff.tmp"
+if [ -e $tmpdir ]; then
+	echo "ERROR creating tmp dir \"$tmpdir\""
+	exit 1
+fi
+mkdir -p $adir $bdir
+mydir=`pwd`
+myname=${0##*/}
+
+# the status files and the directory where the diffs will go in diff mode
+chfile="./changed"
+rmfile="./removed"
+rmdfile="./removed.dir"
+addfile="./added"
+adddfile="./added.dir"
+diffdir="./diffs"
+adddir="./addedfiles"
+
+# subroutines
+
+# Cleanup and exit
+# optional arguments: error code, error message
+bye() {
+	[ -n "$2" ] && echo "$2"
+	rm -fr $tmpdir
+	exit $1
+}
+
+# Print usage message and exit
+# optional argument: error message -> error code 1
+usage() {
+[ -n "$1" ] && echo "$1"
+cat <<EOI
+usage: $myname [mode] (old_tree new_tree) (tree) [options]
+                               |             |
+      --diff mode  ------------/             |
+      --apply mode --------------------------/
+
+mode is either --diff (default) or --apply
+
+options:
+
+   -h, --help     : show this help
+   -f             : force overwriting of existing files (--diff, --apply)
+   -n, --dry-run  : don't change anything, just show what would be done (--apply)
+   -v, --verbose  : verbose output (--apply)
+   --filter expr  : pass "expr" as an argument to find when building file lists
+                    (--apply). WARNING: difftools expands relative paths to absolute
+                    paths, so take care when writing fancy matching patterns!
+   -c, --copy dir : create a copy of "tree" as "dir" before applying patches (--apply)
+EOI
+[ -n "$1" ] && bye 1
+bye
+}
+
+# Remove files only if "-f" has been given
+cautious_rm() {
+	while [ -n "$1" ]; do
+		[ -e "$1" ] && [ ! -f "$1" ] && \
+			bye 1 "ERROR: $1 exists and is not a file!"
+		[ -e "$1" ] && [ -z "$force" ] && \
+			bye 1 "ERROR: file $1 exists; use \"-f\" to overwrite!"
+		[ -e "$1" ] && rm -f "$1"
+		shift
+	done
+}
+
+# Create directories, overwrite only if "-f" has been given
+cautious_mkdir() {
+	while [ -n "$1" ]; do
+		[ -e "$1" ] && [ ! -d "$1" ] && \
+			bye 1 "ERROR: $1 exists and not a directory!"
+		[ -e "$1" ] && [ -z "$force" ] && \
+			bye 1 "ERROR: directory $1 exists; use \"-f\" to overwrite!"
+		[ -e "$1" ] && rm -fr "$1"
+		mkdir "$1"
+		shift
+	done
+}
+
+# Ensure that a dir exists
+check_dir() {
+	if [ -z "$1" ] || [ ! -d "$1" ]; then
+		usage "ERROR: \"$1\" does not exist or is a directory!"
+	fi
+}
+
+# Run a command in its own shell, respect dry-run and verbose settings
+run() {
+	if [ -z "$dryrun" ]; then
+		if ! bash -c "$1"; then
+			bye 1 "ERROR running \"$1\""
+		fi
+	fi
+	if [ -n "$dryrun" ] || [ -n "$verbose" ]; then
+		echo "	$1"
+	fi
+}
+
+# Read a filelist into the array $list; IFS magic ensures correct treatment of entries containing
+# spaces
+readlist() {
+	IFS=$'\n' list=(`cat $1`)
+}
+
+# Iterate a command on all entries of $list, appending the second argument
+iterlist() {
+	for entry in "${list[@]}"; do
+		run "$1 '$2$entry'"
+	done
+}
+
+# Reduce a list of directories to the list of "bottommost" directories (or "topmost" directories if
+# an argument is given)
+compresslist() {
+	rawlist=("${list[@]}")
+	unset list
+	for entry in "${rawlist[@]}"; do
+		keep=yes
+		for key in "${rawlist[@]}"; do
+			if [ -z "$1" ]; then
+				check="${entry#$key}"
+				[ "$entry" != "$check" ] && [ -n "$check" ] && keep=
+			else
+				check="${key#$entry}"
+				[ "$key" != "$check" ] && [ -n "$check" ] && keep=
+			fi
+		done
+		[ -n "$keep" ] && list=("${list[@]}" "$entry")
+	done
+}
+
+# Hack to get an absolute path
+absolutify() {
+	[ -d "$1" ] || bye 1 "ERROR: internal, \"$1\" is no directory!"
+	curdir=`pwd`
+	cd $1
+	res=`pwd`
+	cd $curdir
+}
+
+# ------ Main code ------
+
+# Select modus operandi
+case "$1" in
+	'--diff') shift ;;
+	'--apply') apply=yes; shift ;;
+	'-h'|'--help') usage;;
+esac
+
+# Get directories and check if they are O.K.
+dir1="$1"; shift
+check_dir "$dir1"
+absolutify "$dir1"
+dir1="$res"
+if [ -z "$apply" ]; then
+	dir2="$1"; shift
+	check_dir "$dir2"
+	absolutify "$dir2"
+	dir2="$res"
+fi
+
+# Parse remaining parameters
+while [ -n "$1" ]; do
+	case $1 in
+		'-h' | '--help') usage ;;
+		'-f') force=yes;;
+		'-v'|'--verbose') verbose=yes;;
+		'-n'|'--dry-run') dryrun=yes;;
+		'--filter')
+			shift
+			filter=$1
+			[ -z "$filter" ] && usage "ERROR: --filter requries an argument"
+			;;
+		'-c'|'--copy')
+			shift
+			copy=$1
+			[ -z "$copy" ] && usage "ERROR: --copy requires an argument"
+			;;
+		'');;
+		*) usage "ERROR: unknown parameter $1";;
+	esac
+	shift
+done
+
+# ------ run in diff mode ------
+
+if [ -z "$apply" ]; then
+
+# Make sure that the directories exist and are empty
+cautious_mkdir $diffdir $adddir
+
+# Make sure the status files are gone
+cautious_rm $chfile $addfile $adddfile $rmfile $rmdfile
+
+
+# Build up file lists; IFS magic for filenames containing spaces
+echo "collecting files..."
+IFS=$'\n' files1=(`bash -c "find '$dir1' $filter"`) || \
+	bye 1 "error executing find - invalid --filter ?"
+IFS=$'\n' files2=(`bash -c "find '$dir2' $filter"`) || \
+	bye 1 "error executing find - invalid --filter ?"
+
+# build diff
+echo "generating diff information..."
+
+# Check if anything has been removed or changed
+for file1 in "${files1[@]}"; do
+	stem=${file1#$dir1}
+	file2="$dir2/$stem"
+	#
+	# is it a dir?
+	if [ -d "$file1" ]; then
+		[ -d "$file2" ] || echo $stem >> $rmdfile
+	#
+	# not a dir -> is it a file?
+	elif [ -f "$file1" ]; then
+		#
+		# does its brother exist?
+		if [ -f "$file2" ]; then
+			#
+			# do they differ?
+			if ! cmp -s "$file1" "$file2"; then
+				echo $stem >> $chfile
+				#
+				# create dir if necessary
+				dir="./$stem"; dir="${dir%/*}"
+				[ -e "$diffdir/$dir" ] || mkdir -p "$diffdir/$dir";
+				#
+				# create diff
+				[ -e "$adir/$dir" ] || mkdir -p "$adir/$dir"
+				[ -e "$bdir/$dir" ] || mkdir -p "$bdir/$dir"
+				cp -s "$file1" "$adir/$dir"
+				cp -s "$file2" "$bdir/$dir"
+				cd "$tmpdir"
+				diff -u "a/$stem" "b/$stem" > $difftmp
+				cd "$mydir"
+				#
+				# check if diff worked (-> text) and copy, otherwise copy the newer file
+				if grep -qe '\+\+\+' "$difftmp"; then
+					cp "$difftmp" "$diffdir/$stem.diff"
+				else
+					cp "$file2" "$diffdir/$stem"
+				fi
+			fi
+		# was removed
+		elif [ ! -e "$file2" ]; then
+			echo ${file1#$dir1} >> $rmfile
+		fi
+	# has to be something we don't care about
+	else
+		echo "WARNING: special file $file1 ignored"
+	fi
+done
+
+# Check of anything has been added
+for file2 in "${files2[@]}"; do
+	stem=${file2#$dir2}
+	file1="$dir1/$stem"
+	# is it a dir?
+	if [ -d "$file2" ]; then
+		[ -d "$file1" ] || echo $stem >> $adddfile
+	# not a dir -> a file?
+	elif [ -f "$file2" ]; then
+		if [ ! -f "$file1" ]; then
+			echo $stem >> $addfile
+			dir="$adddir/$stem"; dir="${dir%/*}"
+			[ -e "$dir" ] || mkdir -p "$dir"
+			cp "$file2" "$dir"
+		fi
+	# something else -> don't care
+	else
+		echo "WARNING: special file $file2 ignored"
+	fi
+done
+
+# ------ run in apply mode ------
+else
+
+[ -n "$dryrun" ] && \
+echo -e "dry run, showing the commands that would be run (each in its own subshell)...\n"
+
+if [ -n "$copy" ]; then
+	echo "copying \"$dir1\" to \"$copy\""
+	[ -e "$copy" ] && [ ! -d "$copy" ] && \
+		bye 1 "ERROR: \"$copy\" exists and is not a directory"
+	[ -d "$copy" ] && [ -z "$force" ] && \
+		bye 1 "ERROR: \"$copy\" exists, use \"-f\" to overwrite"
+	[ -d "$copy" ] && run "rm -fr '$copy'"
+	run "cp -r '$dir1' '$copy'"
+	dir1="$copy"
+fi
+
+echo "applying..."
+
+[ -f $chfile ] && [ ! -d $diffdir ] && \
+	bye 1 "ERROR: diff log \"$chfile\" found but no diff directory \"$diffdir\" exists!"
+
+[ -f $addfile ] && [ ! -d $adddir ] && \
+	bye 1 "ERROR: add log \"$addfile\" found but no add directory \"$adddir\" exists!"
+
+if [ -f $rmfile ]; then
+	echo "removing files..."
+	readlist "$rmfile"
+	iterlist "rm -f" "$dir1/"
+fi
+
+if [ -f $rmdfile ]; then
+	echo "removing directories..."
+	readlist "$rmdfile"
+	compresslist
+	iterlist "rm -fr" "$dir1/"
+fi
+
+if [ -f $chfile ]; then
+	echo "applying patches..."
+	readlist "$chfile"
+	for entry in "${list[@]}"; do 
+		if [ -e "$diffdir/$entry.diff" ]; then
+			run "cd '$dir1'; patch -p1 < '$mydir/$diffdir/$entry.diff'"
+		else
+			stem=${entry%/*}
+			run "cp -f '$diffdir/$entry' '$dir1/$stem'"
+		fi
+	done
+fi
+
+if [ -f $adddfile ]; then
+	echo "creating new directories..."
+	readlist "$adddfile"
+	compresslist anti
+	iterlist "mkdir -p" "$dir1/"
+fi
+
+if [ -f $addfile ]; then
+	echo "copying new files..."
+	readlist "$addfile"
+	for entry in "${list[@]}"; do
+		stem="${entry%/*}"
+		run "cp '$adddir/$entry' '$dir1/$stem'"
+	done
+fi
+
+fi
+bye
